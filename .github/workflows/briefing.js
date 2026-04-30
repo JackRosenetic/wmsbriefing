@@ -150,4 +150,6 @@ _Briefing auto-generated · Hamper WMS · https://hamperwms.replit.app_`;
   } else {
     console.error('❌ Slack error:', slackData.error);
     process.exit(1);
-  }
+  }}
+
+main().catch(err => { console.error('Fatal:', err); process.exit(1); });
