@@ -126,11 +126,23 @@ ${orderTable}
 ---
 _Briefing auto-generated · Hamper WMS · https://hamperwms.replit.app_`;
 
-  // 11. Send to Slack
+  // 11. Open DM channel then send
+  const openRes = await fetch('https://slack.com/api/conversations.open', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SLACK_TOKEN}` },
+    body: JSON.stringify({ users: 'U0A0V9RHZSN' })
+  });
+  const openData = await openRes.json();
+  if (!openData.ok) {
+    console.error('❌ Failed to open DM:', openData.error);
+    process.exit(1);
+  }
+  const dmChannel = openData.channel.id;
+
   const slackRes = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SLACK_TOKEN}` },
-    body: JSON.stringify({ channel: SLACK_CHANNEL, text: message, mrkdwn: true })
+    body: JSON.stringify({ channel: dmChannel, text: message, mrkdwn: true })
   });
   const slackData = await slackRes.json();
   if (slackData.ok) {
@@ -139,6 +151,3 @@ _Briefing auto-generated · Hamper WMS · https://hamperwms.replit.app_`;
     console.error('❌ Slack error:', slackData.error);
     process.exit(1);
   }
-}
-
-main().catch(err => { console.error('Fatal:', err); process.exit(1); });
