@@ -1,4 +1,4 @@
-const SLACK_CHANNEL = 'D0A187GQTAM';
+const SLACK_CHANNEL = 'U0A0V9RHZSN';
 const WMS_BASE = 'https://hamperwms.replit.app';
 const WMS_EMAIL = 'jack@rosenetic.com';
 const WMS_PASSWORD = process.env.WMS_PASSWORD;
