@@ -21,4 +21,4 @@ jobs:
         env:
           WMS_PASSWORD: ${{ secrets.WMS_PASSWORD }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        run: node briefing.js
+        run: node .github/workflows/briefing.js
