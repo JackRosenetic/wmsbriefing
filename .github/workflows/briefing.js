@@ -43,7 +43,7 @@ async function main() {
   console.log('Fetching data...');
   const [sales, forecast, timing, shipments, reorder] = await Promise.all([
     wmsGet(`/api/amazon/sales-summary?startDate=${yyyymmdd}&endDate=${yyyymmdd}&groupBy=day`, cookie),
-    wmsGet('/api/sales/forecast-report?preset=30d', cookie),
+    wmsGet('/api/pack-shipments/plan', cookie),
     wmsGet('/api/shipment-timing', cookie),
     wmsGet('/api/shipment-tracking', cookie),
     wmsGet('/api/reorder-recommendations', cookie),
@@ -56,11 +56,13 @@ async function main() {
     .map((h, i) => `${i+1}. ${h.hamperName.substring(0, 65).trim()}… — ${h.unitsSold} units`).join('\n');
 
   // 6. Top 5 urgent hampers
-  const forecastRows = Array.isArray(forecast) ? forecast : (forecast.rows || forecast.hampers || forecast.data || []);
-  const top5 = [...forecastRows].sort((a,b) => (a.daysCover??9999)-(b.daysCover??9999)).slice(0,5);
+  const forecastRows = forecast.rows || [];
+  const top5 = [...forecastRows]
+    .filter(h => h.fbaStatus === 'send_now' || h.daysOfCover < 40)
+    .sort((a,b) => (a.daysOfCover??9999)-(b.daysOfCover??9999)).slice(0,5);
   const top5Table = top5.map((h, i) => {
-    const name = (h.productName||h.name||h.hamperName||'').substring(0, 65);
-    return `| ${i+1} | ${name} | ${h.daysCover} days | *${h.recommendedSend||h.recommendedQuantity||'?'}* |`;
+    const name = (h.hamperName||'').substring(0, 65);
+    return `| ${i+1} | ${name} | ${h.daysOfCover} days | *${h.recommendedSend||'?'}* |`;
   }).join('\n');
 
   // 7. Inbound timing
