@@ -1,14 +1,34 @@
-const SLACK_CHANNEL = 'U0A0V9RHZSN';
+const SLACK_CHANNEL = 'D0A187GQTAM';
 const WMS_BASE = 'https://hamperwms.replit.app';
 const WMS_EMAIL = 'jack@rosenetic.com';
 const WMS_PASSWORD = process.env.WMS_PASSWORD;
 const SLACK_TOKEN = process.env.SLACK_BOT_TOKEN;
 
+async function wmsPost(path, cookie) {
+  try {
+    await fetch(`${WMS_BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie }
+    });
+  } catch (e) { console.warn(`Sync warning ${path}: ${e.message}`); }
+}
+
 async function wmsGet(path, cookie) {
-  const res = await fetch(`${WMS_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', 'Cookie': cookie }
+  try {
+    const res = await fetch(`${WMS_BASE}${path}`, { headers: { Cookie: cookie } });
+    if (!res.ok) { console.warn(`WARN ${path} → ${res.status}`); return null; }
+    return res.json();
+  } catch (e) { console.warn(`ERROR ${path}: ${e.message}`); return null; }
+}
+
+async function sendSlack(message) {
+  const res = await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_TOKEN}` },
+    body: JSON.stringify({ channel: SLACK_CHANNEL, text: message, mrkdwn: true })
   });
-  return res.json();
+  const data = await res.json();
+  if (!data.ok) throw new Error('Slack error: ' + data.error);
 }
 
 async function main() {
@@ -18,17 +38,21 @@ async function main() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: WMS_EMAIL, password: WMS_PASSWORD })
   });
+  if (!loginRes.ok) {
+    await sendSlack('⚠️ Daily WMS briefing failed — could not log in to https://hamperwms.replit.app/');
+    process.exit(1);
+  }
   const setCookies = loginRes.headers.getSetCookie
     ? loginRes.headers.getSetCookie()
     : [loginRes.headers.get('set-cookie') || ''];
   const cookie = setCookies.map(c => c.split(';')[0]).join('; ');
   await loginRes.json();
-  console.log('Logged in.');
+  console.log('Logged in ✓');
 
-  // 2. Fire both syncs (fire and forget)
-  fetch(`${WMS_BASE}/api/amazon/sync-inventory-v2`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Cookie': cookie } });
-  fetch(`${WMS_BASE}/api/shipment-tracking/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Cookie': cookie } });
-  console.log('Syncs fired. Waiting 90 seconds...');
+  // 2. Fire syncs (fire-and-proceed)
+  wmsPost('/api/amazon/sync-inventory-v2', cookie);
+  wmsPost('/api/shipment-tracking/sync', cookie);
+  console.log('Syncs fired. Waiting 90s...');
   await new Promise(r => setTimeout(r, 90000));
 
   // 3. Dates
@@ -39,119 +63,90 @@ async function main() {
   const yyyymmdd = `${yesterday.getFullYear()}-${pad(yesterday.getMonth()+1)}-${pad(yesterday.getDate())}`;
   const todayLabel = today.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 
-  // 4. Fetch all data
+  // 4. Fetch all data in parallel
   console.log('Fetching data...');
-  const [sales, forecast, timing, shipments, reorder] = await Promise.all([
+  const [sales, forecast, timing, tracking, reorder] = await Promise.all([
     wmsGet(`/api/amazon/sales-summary?startDate=${yyyymmdd}&endDate=${yyyymmdd}&groupBy=day`, cookie),
-    wmsGet('/api/pack-shipments/plan', cookie),
+    wmsGet('/api/sales/forecast-report?preset=30d', cookie),
     wmsGet('/api/shipment-timing', cookie),
     wmsGet('/api/shipment-tracking', cookie),
     wmsGet('/api/reorder-recommendations', cookie),
   ]);
 
-  // 5. Process sales
-  const unitsSold = sales.totals?.unitsSold || 0;
-  const ordersCount = sales.totals?.ordersCount || 0;
-  const top3 = (sales.byHamper || []).slice(0, 3)
-    .map((h, i) => `${i+1}. ${h.hamperName.substring(0, 65).trim()}… — ${h.unitsSold} units`).join('\n');
+  // 5. Sales prose
+  const unitsSold = sales?.totals?.unitsSold ?? 0;
+  const ordersCount = sales?.totals?.ordersCount ?? 0;
+  const topProducts = (sales?.byHamper || []).slice(0, 3);
+  let salesProse;
+  if (topProducts.length) {
+    const top2 = topProducts.slice(0, 2)
+      .map(h => `${(h.productName || h.hamperName || '').split(' -')[0].trim()} (${h.unitsSold || h.units || 0} units)`)
+      .join(' and ');
+    salesProse = `Yesterday saw ${unitsSold} units sold across ${ordersCount} orders. Top performers were ${top2}.`;
+  } else {
+    salesProse = `(data unavailable) — ${unitsSold} units / ${ordersCount} orders.`;
+  }
 
-  // 6. Top 5 urgent hampers
-  const forecastRows = forecast.rows || [];
-  const top5 = [...forecastRows]
-    .filter(h => h.fbaStatus === 'send_now' || h.daysOfCover < 40)
-    .sort((a,b) => (a.daysOfCover??9999)-(b.daysOfCover??9999)).slice(0,5);
-  const top5Table = top5.map((h, i) => {
-    const name = (h.hamperName||'').substring(0, 65);
-    return `| ${i+1} | ${name} | ${h.daysOfCover} days | *${h.recommendedSend||'?'}* |`;
-  }).join('\n');
+  // 6. Top 5 most urgent — sorted by daysCover
+  const forecastRows = Array.isArray(forecast) ? forecast : (forecast?.rows || forecast?.hampers || []);
+  const top5 = [...forecastRows].sort((a, b) => (a.daysCover ?? 9999) - (b.daysCover ?? 9999)).slice(0, 5);
+  const urgentLines = top5.map(h =>
+    `• ${h.productName || 'Unknown'} - Days of Cover (${Math.round((h.daysCover || 0) * 10) / 10}d) Recommended Send ${h.recommendedSend || 0}`
+  ).join('\n') || '(data unavailable)';
 
   // 7. Inbound timing
-  const avgInbound = timing.avgInboundDays || 'N/A';
-  const completedCount = timing.completedCount || 0;
+  const avgD = timing?.avgInboundDays ?? 'N/A';
+  const completedCount = timing?.completedCount ?? 0;
+  const minD = timing?.minInboundDays ?? 'N/A';
+  const maxD = timing?.maxInboundDays ?? 'N/A';
+  const timingLine = `Current average inbound time is *${avgD}d* across ${completedCount} completed shipments (range: ${minD}d – ${maxD}d).`;
 
-  // 8. Delayed shipments
-  const allShipments = Array.isArray(shipments) ? shipments : (shipments.shipments || shipments.data || []);
+  // 8. Delayed shipments (>7 days)
+  const allShipments = Array.isArray(tracking) ? tracking : (tracking?.shipments || []);
   const delayed = allShipments.filter(s => s.isDelayed && !s.isCompleted);
-  const delayedTable = delayed.map(s => {
-    const name = (s.shipmentName||s.amazonShipmentName||s.name||'Unknown').substring(0, 40);
-    return `| ${name} | ${s.daysSinceCollection} days | ${s.percentReceived}% | ${s.quantityReceived} / ${s.quantityExpected} |`;
-  }).join('\n');
+  const delayedLines = delayed.map(s =>
+    `• ${s.shipmentName || s.amazonShipmentName || 'Unknown'} — ${s.daysSinceCollection} days in transit | Status: ${s.amazonStatus} | Progress: ${s.quantityReceived}/${s.quantityExpected} units (${s.percentReceived}%)`
+  ).join('\n') || '✅ No delayed shipments';
 
-  // 9. Order now
-  const reorderItems = Array.isArray(reorder) ? reorder : (reorder.recommendations || reorder.items || reorder.data || []);
-  const orderNow = reorderItems.filter(i => i.category === 'order_now');
-  const orderTable = orderNow.map(i =>
-    `| ${(i.name||i.productName||'').trim()} | *${i.casesToOrder} cases* | ${i.currentStock} units | ${i.daysOfStock} days |`
-  ).join('\n');
+  // 9. Items to order now
+  const recs = Array.isArray(reorder) ? reorder : (reorder?.recommendations || []);
+  const orderNow = recs.filter(i => i.category === 'order_now');
+  const orderLines = orderNow.map(i =>
+    `• ${(i.name || '').trim()} — Order ${i.casesToOrder} cases (stock: ${i.currentStock} units / ${i.daysOfStock} days remaining)`
+  ).join('\n') || '✅ No items need ordering today';
 
-  // 10. Compose message
-  const message = `🏭 *Hamper WMS — Daily Briefing | ${todayLabel}*
+  // 10. Compose and send
+  const message = `📅 *${todayLabel}*
 
----
-
-*📦 Yesterday's Sales (${yyyymmdd})*
-*${unitsSold} units* sold across *${ordersCount} orders*.
-
-Top sellers:
-${top3}
+*Yesterday's Sales*
+${salesProse}
 
 ---
 
-*🚨 Top 5 Most Urgent Hampers to Pack*
-_Sorted by lowest days of cover — prioritise these first._
-
-| # | Hamper | Days Cover | Send Qty |
-|---|--------|-----------|----------|
-${top5Table}
+*🚚 Avg Inbound Time*
+${timingLine}
 
 ---
 
-*⏱️ Average Inbound Time (Build & Send)*
-*${avgInbound} days* average across ${completedCount} completed shipments.
+*📦 Top 5 Most Urgent to Pack* — lowest days of cover first
+${urgentLines}
 
 ---
 
-*⚠️ Delayed Shipments (>7 Days) — ${delayed.length} active*
-
-| Shipment | Age | Progress | Units In |
-|----------|-----|----------|---------|
-${delayedTable}
+*⏰ Delayed Shipments (>7 days)*
+${delayedLines}
 
 ---
 
-*🛒 Items to Order Now*
+*⚠️ Items to Order*
+${orderLines}`;
 
-| Item | Order | Stock | Days Left |
-|------|-------|-------|----------|
-${orderTable}
+  await sendSlack(message);
+  console.log('✅ Brief sent to Slack!');
+}
 
----
-_Briefing auto-generated · Hamper WMS · https://hamperwms.replit.app_`;
-
-  // 11. Open DM channel then send
-  const openRes = await fetch('https://slack.com/api/conversations.open', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SLACK_TOKEN}` },
-    body: JSON.stringify({ users: 'U0A0V9RHZSN' })
-  });
-  const openData = await openRes.json();
-  if (!openData.ok) {
-    console.error('❌ Failed to open DM:', openData.error);
-    process.exit(1);
-  }
-  const dmChannel = openData.channel.id;
-
-  const slackRes = await fetch('https://slack.com/api/chat.postMessage', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SLACK_TOKEN}` },
-    body: JSON.stringify({ channel: dmChannel, text: message, mrkdwn: true })
-  });
-  const slackData = await slackRes.json();
-  if (slackData.ok) {
-    console.log('✅ Briefing sent to Slack!');
-  } else {
-    console.error('❌ Slack error:', slackData.error);
-    process.exit(1);
-  }}
-
-main().catch(err => { console.error('Fatal:', err); process.exit(1); });
+main().catch(async err => {
+  console.error('Fatal:', err);
+  try { await sendSlack('⚠️ Daily WMS briefing failed with error: ' + err.message); } catch (_) {}
+  process.exit(1);
+});
