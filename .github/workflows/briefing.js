@@ -32,7 +32,6 @@ async function sendSlack(message) {
 }
 
 async function main() {
-  // 1. Login
   const loginRes = await fetch(`${WMS_BASE}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -49,13 +48,11 @@ async function main() {
   await loginRes.json();
   console.log('Logged in ✓');
 
-  // 2. Fire syncs (fire-and-proceed)
   wmsPost('/api/amazon/sync-inventory-v2', cookie);
   wmsPost('/api/shipment-tracking/sync', cookie);
   console.log('Syncs fired. Waiting 90s...');
   await new Promise(r => setTimeout(r, 90000));
 
-  // 3. Dates
   const today = new Date();
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
@@ -63,17 +60,15 @@ async function main() {
   const yyyymmdd = `${yesterday.getFullYear()}-${pad(yesterday.getMonth()+1)}-${pad(yesterday.getDate())}`;
   const todayLabel = today.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 
-  // 4. Fetch all data in parallel
   console.log('Fetching data...');
-  const [sales, forecast, timing, tracking, reorder] = await Promise.all([
+  const [sales, packPlan, timing, tracking, reorder] = await Promise.all([
     wmsGet(`/api/amazon/sales-summary?startDate=${yyyymmdd}&endDate=${yyyymmdd}&groupBy=day`, cookie),
-    wmsGet('/api/sales/forecast-report?preset=30d', cookie),
+    wmsGet('/api/pack-shipments/plan', cookie),
     wmsGet('/api/shipment-timing', cookie),
     wmsGet('/api/shipment-tracking', cookie),
     wmsGet('/api/reorder-recommendations', cookie),
   ]);
 
-  // 5. Sales prose
   const unitsSold = sales?.totals?.unitsSold ?? 0;
   const ordersCount = sales?.totals?.ordersCount ?? 0;
   const topProducts = (sales?.byHamper || []).slice(0, 3);
@@ -87,35 +82,42 @@ async function main() {
     salesProse = `(data unavailable) — ${unitsSold} units / ${ordersCount} orders.`;
   }
 
-  // 6. Top 5 most urgent — sorted by daysCover
-  const forecastRows = Array.isArray(forecast) ? forecast : (forecast?.rows || forecast?.hampers || []);
-  const top5 = [...forecastRows].sort((a, b) => (a.daysCover ?? 9999) - (b.daysCover ?? 9999)).slice(0, 5);
-  const urgentLines = top5.map(h =>
-    `• ${h.productName || 'Unknown'} - Days of Cover (${Math.round((h.daysCover || 0) * 10) / 10}d) Recommended Send ${h.recommendedSend || 0}`
-  ).join('\n') || '(data unavailable)';
+  // Combine hamper rows (daysOfCover) and DIY rows (daysCover) and sort together
+  const hamperRows = (packPlan?.rows || []).map(h => ({
+    name: h.hamperName || h.productName || 'Unknown',
+    cover: h.daysOfCover ?? 9999,
+    send: h.recommendedSend || 0,
+  }));
+  const diyRows = (packPlan?.diyRows || []).map(d => ({
+    name: d.productName || d.hamperName || 'Unknown',
+    cover: d.daysCover ?? 9999,
+    send: d.recommendedSend || 0,
+  }));
+  const allProducts = [...hamperRows, ...diyRows]
+    .sort((a, b) => a.cover - b.cover)
+    .slice(0, 5);
+  const urgentLines = allProducts.length
+    ? allProducts.map(p => `• ${p.name} - Days of Cover (${Math.round(p.cover * 10) / 10}d) Recommended Send ${p.send}`).join('\n')
+    : '(data unavailable)';
 
-  // 7. Inbound timing
   const avgD = timing?.avgInboundDays ?? 'N/A';
   const completedCount = timing?.completedCount ?? 0;
   const minD = timing?.minInboundDays ?? 'N/A';
   const maxD = timing?.maxInboundDays ?? 'N/A';
   const timingLine = `Current average inbound time is *${avgD}d* across ${completedCount} completed shipments (range: ${minD}d – ${maxD}d).`;
 
-  // 8. Delayed shipments (>7 days)
   const allShipments = Array.isArray(tracking) ? tracking : (tracking?.shipments || []);
   const delayed = allShipments.filter(s => s.isDelayed && !s.isCompleted);
   const delayedLines = delayed.map(s =>
     `• ${s.shipmentName || s.amazonShipmentName || 'Unknown'} — ${s.daysSinceCollection} days in transit | Status: ${s.amazonStatus} | Progress: ${s.quantityReceived}/${s.quantityExpected} units (${s.percentReceived}%)`
   ).join('\n') || '✅ No delayed shipments';
 
-  // 9. Items to order now
   const recs = Array.isArray(reorder) ? reorder : (reorder?.recommendations || []);
   const orderNow = recs.filter(i => i.category === 'order_now');
   const orderLines = orderNow.map(i =>
     `• ${(i.name || '').trim()} — Order ${i.casesToOrder} cases (stock: ${i.currentStock} units / ${i.daysOfStock} days remaining)`
   ).join('\n') || '✅ No items need ordering today';
 
-  // 10. Compose and send
   const message = `📅 *${todayLabel}*
 
 *Yesterday's Sales*
